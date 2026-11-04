@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""SoftShape system tray: Open · Stop · Quit while the local server is running."""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+AppIndicator = None
+for _ns in ("AyatanaAppIndicator3", "AppIndicator3"):
+    try:
+        gi.require_version(_ns, "0.1")
+        if _ns == "AyatanaAppIndicator3":
+            from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+        else:
+            from gi.repository import AppIndicator3 as AppIndicator  # noqa: E402
+        break
+    except ValueError:
+        continue
+
+APP_DIR = Path(__file__).resolve().parent.parent
+SOFTSHAPE = Path.home() / ".local" / "bin" / "softshape"
+if not SOFTSHAPE.exists():
+    SOFTSHAPE = APP_DIR / "scripts" / "softshape"
+
+ICON = APP_DIR / "public" / "softshape-tray.png"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "softshape"
+PID_FILE = CACHE / "tray.pid"
+PORT = os.environ.get("SOFTSHAPE_PORT", "5173")
+
+
+def lan_ip() -> str:
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "route", "get", "1.1.1.1"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        parts = out.split()
+        if "src" in parts:
+            return parts[parts.index("src") + 1]
+    except (subprocess.CalledProcessError, FileNotFoundError, IndexError, ValueError):
+        pass
+    return "localhost"
+
+
+def server_alive() -> bool:
+    server_pid = CACHE / "server.pid"
+    if not server_pid.exists():
+        return False
+    try:
+        pid = int(server_pid.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def run_softshape(*args: str) -> None:
+    subprocess.Popen(
+        [str(SOFTSHAPE), *args],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def notify(msg: str) -> None:
+    try:
+        subprocess.Popen(
+            ["notify-send", "-a", "SoftShape", "SoftShape", msg],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+
+class SoftShapeTray:
+    def __init__(self) -> None:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()))
+
+        icon_path = str(ICON if ICON.exists() else APP_DIR / "public" / "softshape-icon.png")
+        self.indicator = AppIndicator.Indicator.new(
+            "softshape",
+            icon_path,
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("SoftShape")
+        if hasattr(self.indicator, "set_icon_full"):
+            self.indicator.set_icon_full(icon_path, "Trans pride flag — SoftShape")
+
+        self.status_item = Gtk.MenuItem(label=self._status_label())
+        self.status_item.set_sensitive(False)
+
+        menu = Gtk.Menu()
+        open_item = Gtk.MenuItem(label="Open SoftShape")
+        open_item.connect("activate", self.on_open)
+        phone_item = Gtk.MenuItem(label="Show phone URL")
+        phone_item.connect("activate", self.on_phone_url)
+        quit_item = Gtk.MenuItem(label="Quit SoftShape")
+        quit_item.connect("activate", self.on_quit)
+
+        for item in (
+            self.status_item,
+            Gtk.SeparatorMenuItem(),
+            open_item,
+            phone_item,
+            Gtk.SeparatorMenuItem(),
+            quit_item,
+        ):
+            menu.append(item)
+            item.show()
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+        GLib.timeout_add_seconds(2, self.poll_server)
+        signal.signal(signal.SIGTERM, lambda *_: self.quit())
+        signal.signal(signal.SIGINT, lambda *_: self.quit())
+
+    def _status_label(self) -> str:
+        ip = lan_ip()
+        return f"Running · :{PORT} · {ip}"
+
+    def poll_server(self) -> bool:
+        if not server_alive():
+            self.quit()
+            return False
+        self.status_item.set_label(self._status_label())
+        return True
+
+    def on_open(self, *_args) -> None:
+        run_softshape("open")
+
+    def on_phone_url(self, *_args) -> None:
+        url = f"http://{lan_ip()}:{PORT}/"
+        notify(url)
+        try:
+            subprocess.run(
+                ["wl-copy"],
+                input=url.encode(),
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            try:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=url.encode(),
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                pass
+
+    def on_quit(self, *_args) -> None:
+        run_softshape("stop")
+        self.quit()
+
+    def quit(self) -> None:
+        try:
+            if PID_FILE.exists() and PID_FILE.read_text().strip() == str(os.getpid()):
+                PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        Gtk.main_quit()
+
+    def run(self) -> None:
+        Gtk.main()
+
+
+def already_running() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        PID_FILE.unlink(missing_ok=True)
+        return False
+
+
+def main() -> int:
+    if AppIndicator is None:
+        print(
+            "SoftShape tray: install libayatana-appindicator / libappindicator "
+            "and ensure a StatusNotifier tray (e.g. Waybar) is running.",
+            file=sys.stderr,
+        )
+        return 1
+    if already_running():
+        return 0
+    if not ICON.exists() and not (APP_DIR / "public" / "softshape-icon.png").exists():
+        print("SoftShape tray icon PNG missing", file=sys.stderr)
+        return 1
+    SoftShapeTray().run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

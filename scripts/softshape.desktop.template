@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SoftShape
+Comment=Start or stop SoftShape (workout tracker + LAN server)
+Exec="@BINDIR@/softshape" toggle
+Icon=@APP_DIR@/public/softshape-icon.png
+Terminal=false
+Categories=Utility;Health;
+StartupNotify=false

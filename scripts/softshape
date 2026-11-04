@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# SoftShape server helper for Wofi / terminal: start | stop | toggle | status | open
+set -euo pipefail
+
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+  _dir="$(cd "$(dirname "$_self")" && pwd)"
+  _self="$(readlink "$_self")"
+  [[ "$_self" != /* ]] && _self="$_dir/$_self"
+done
+APP_DIR="$(cd "$(dirname "$_self")/.." && pwd)"
+unset _self _dir
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/softshape"
+PID_FILE="$CACHE_DIR/server.pid"
+TRAY_PID_FILE="$CACHE_DIR/tray.pid"
+LOG_FILE="$CACHE_DIR/server.log"
+PORT="${SOFTSHAPE_PORT:-5173}"
+TRAY_SCRIPT="$APP_DIR/scripts/softshape-tray"
+
+mkdir -p "$CACHE_DIR"
+
+tray_running() {
+  if [[ ! -f "$TRAY_PID_FILE" ]]; then
+    return 1
+  fi
+  local pid
+  pid="$(cat "$TRAY_PID_FILE" 2>/dev/null || true)"
+  if [[ -z "${pid:-}" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$TRAY_PID_FILE"
+    return 1
+  fi
+  return 0
+}
+
+start_tray() {
+  if [[ "${SOFTSHAPE_TRAY:-1}" != "1" ]]; then
+    return 0
+  fi
+  if tray_running; then
+    return 0
+  fi
+  if [[ ! -x "$TRAY_SCRIPT" ]]; then
+    return 0
+  fi
+  nohup "$TRAY_SCRIPT" >>"$LOG_FILE" 2>&1 &
+  local i
+  for i in $(seq 1 20); do
+    if tray_running; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_tray() {
+  if tray_running; then
+    local pid
+    pid="$(cat "$TRAY_PID_FILE")"
+    kill "$pid" 2>/dev/null || true
+    sleep 0.2
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$TRAY_PID_FILE"
+  fi
+}
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a SoftShape "SoftShape" "$1" 2>/dev/null || true
+  fi
+  printf '%s\n' "$1"
+}
+
+lan_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}'
+}
+
+is_running() {
+  if [[ ! -f "$PID_FILE" ]]; then
+    return 1
+  fi
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -z "${pid:-}" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    return 1
+  fi
+  return 0
+}
+
+wait_for_port() {
+  local i
+  for i in $(seq 1 40); do
+    if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+cmd_start() {
+  if is_running; then
+    local ip
+    ip="$(lan_ip)"
+    start_tray
+    notify "Already running — http://${ip:-localhost}:${PORT}/"
+    return 0
+  fi
+
+  if [[ ! -d "$APP_DIR" ]]; then
+    notify "App folder not found: $APP_DIR"
+    return 1
+  fi
+
+  cd "$APP_DIR"
+  if [[ ! -d node_modules ]]; then
+    notify "Installing dependencies…"
+    npm install >>"$LOG_FILE" 2>&1
+  fi
+
+  # Free the port if a stray Vite is lingering
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+
+  nohup node "$APP_DIR/node_modules/vite/bin/vite.js" --host --port "$PORT" >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+  echo "$pid" >"$PID_FILE"
+
+  if wait_for_port; then
+    local ip
+    ip="$(lan_ip)"
+    if ! start_tray && [[ "${SOFTSHAPE_TRAY:-1}" == "1" ]]; then
+      notify "Running (no tray) — install tray libs: ${APP_DIR}/scripts/install-tray-deps.sh"
+    fi
+    notify "Running — PC: http://localhost:${PORT}/ · Phone: http://${ip:-?}:${PORT}/"
+    if [[ "${SOFTSHAPE_OPEN:-1}" == "1" ]] && command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "http://localhost:${PORT}/" >/dev/null 2>&1 || true
+    fi
+  else
+    notify "Started but not responding yet — check $LOG_FILE"
+  fi
+}
+
+cmd_stop() {
+  local stopped=0
+  if is_running; then
+    local pid
+    pid="$(cat "$PID_FILE")"
+    kill "$pid" 2>/dev/null || true
+    # Also stop child vite if npm left it around
+    pkill -P "$pid" 2>/dev/null || true
+    sleep 0.4
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    stopped=1
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    if fuser "${PORT}/tcp" >/dev/null 2>&1; then
+      fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+      stopped=1
+    fi
+  fi
+  stop_tray
+  if [[ "$stopped" -eq 1 ]]; then
+    notify "Stopped"
+  else
+    notify "Was not running"
+  fi
+}
+
+cmd_toggle() {
+  if is_running; then
+    cmd_stop
+  else
+    cmd_start
+  fi
+}
+
+cmd_status() {
+  if is_running; then
+    local ip
+    ip="$(lan_ip)"
+    notify "Running (pid $(cat "$PID_FILE")) — http://${ip:-localhost}:${PORT}/"
+  else
+    notify "Stopped"
+  fi
+}
+
+cmd_open() {
+  local ip
+  ip="$(lan_ip)"
+  if ! is_running; then
+    cmd_start
+  fi
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "http://localhost:${PORT}/" >/dev/null 2>&1 || true
+  fi
+  printf 'Phone URL: http://%s:%s/\n' "${ip:-localhost}" "$PORT"
+}
+
+usage() {
+  cat <<EOF
+Usage: softshape <start|stop|toggle|status|open|tray>
+
+  start   Start SoftShape (LAN), tray icon, and open the browser
+  stop    Stop the server and tray
+  toggle  Start if stopped, stop if running (good for Wofi)
+  status  Show whether it is running
+  open    Ensure running and open locally
+  tray    Show the tray icon if the server is already running
+
+Wofi: use the SoftShape desktop entry (toggle).
+Set SOFTSHAPE_TRAY=0 to disable the tray icon.
+EOF
+}
+
+cmd_tray() {
+  if ! is_running; then
+    notify "Start SoftShape first"
+    return 1
+  fi
+  start_tray
+  if tray_running; then
+    notify "Tray icon active"
+  else
+    notify "Could not start tray — is a StatusNotifier host running?"
+    return 1
+  fi
+}
+
+case "${1:-toggle}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  toggle) cmd_toggle ;;
+  status) cmd_status ;;
+  open) cmd_open ;;
+  tray) cmd_tray ;;
+  -h|--help|help) usage ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
