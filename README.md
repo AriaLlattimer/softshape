@@ -117,7 +117,16 @@ Logs: `~/.cache/softshape/server.log`
 
 ## Sharing with a friend
 
-Send the project (git link or archive **without** `node_modules` / `dist`) and point them to **Setup from scratch** above. No account or cloud service is required. Remind them this app is a fitness companion, not medical or HRT dosing advice.
+**Git (recommended):**
+
+```bash
+git clone https://github.com/AriaLlattimer/softshape.git
+cd softshape
+```
+
+The repo is **private**. On GitHub: **Settings → Collaborators** → add their GitHub username so they can clone.
+
+Then they follow **Setup from scratch** above (`npm install`, `./scripts/install-launcher.sh`, etc.). No app account is required. Remind them this is a fitness companion, not medical or HRT dosing advice.
 
 ## Privacy
 
